@@ -125,11 +125,19 @@ async function performScrape(filters) {
                     });
 
                     for (const adUrl of adLinks.slice(0, limit - results.length)) {
+                        console.log(`🔍 Analisando anúncio: ${adUrl}`);
                         const docId = Buffer.from(adUrl).toString('base64').replace(/[/+=]/g, '');
                         const existing = await db.collection('listings').doc(docId).get();
-                        if (existing.exists && existing.data().status === 'ignored') continue;
 
-                        await updateStatus(`Extraindo ${results.length + 1}/${limit}`, 50, adUrl, foundLinks);
+                        if (existing.exists && existing.data().status === 'ignored') {
+                            console.log(`⏩ Ignorado (status no banco): ${adUrl}`);
+                            continue;
+                        }
+
+                        // Calcula o progresso real baseado no limite
+                        const currentProgress = Math.floor(((results.length) / limit) * 100);
+                        await updateStatus(`Extraindo ${results.length + 1}/${limit}`, currentProgress, adUrl, foundLinks);
+
                         await page.goto(adUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
                         const data = await page.evaluate(() => {
@@ -181,11 +189,16 @@ async function performScrape(filters) {
                         };
 
                         await db.collection('listings').doc(docId).set(item, { merge: true });
+                        console.log(`✅ Extraído e Salvo: ${data.title} - ${data.price}`);
+
                         results.push(item);
                         foundLinks.push(adUrl);
 
+                        // Atualiza o status IMEDIATAMENTE após o save para aparecer na tela original
+                        await updateStatus(`Item ${results.length} salvo!`, Math.floor((results.length / limit) * 100), adUrl, foundLinks);
+
                         // Espera um pouco entre anúncios para evitar Cloudflare
-                        await new Promise(r => setTimeout(r, 10000));
+                        await new Promise(r => setTimeout(r, 15000));
                     }
                 } catch (e) {
                     console.error(`Erro na página ${url}:`, e.message);
