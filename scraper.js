@@ -29,18 +29,23 @@ const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '2U1KDYckXbPO4pc065f0
 const PROXY_LIST = (process.env.SCRAPER_PROXY_LIST || process.env.SCRAPER_PROXY || '').split(',').filter(p => !!p);
 
 function getBrowserlessWS() {
-    // Usamos flags nativas do Browserless para aumentar o sucesso:
-    // --stealth: Ativa o modo furtivo nativo do Browserless
-    // --blockAds: Remove anúncios que podem causar lentidão e detecção
-    // proxyCountry=br: Tenta usar infraestrutura brasileira se disponível
-    let ws = `wss://chrome.browserless.io?token=${BROWSERLESS_TOKEN}&--stealth&--blockAds&proxyCountry=br`;
+    // Modo Furtivo Nativo do Browserless.io via query params (Mais estável)
+    const params = new URLSearchParams({
+        token: BROWSERLESS_TOKEN,
+        stealth: 'true',
+        blockAds: 'true'
+    });
 
+    // Constrói a URL base
+    let ws = `wss://chrome.browserless.io?${params.toString()}`;
+
+    // Adiciona proxy extra se configurado
     if (PROXY_LIST.length > 0) {
         const randomProxy = PROXY_LIST[Math.floor(Math.random() * PROXY_LIST.length)];
         ws += `&--proxy-server=${randomProxy}`;
-        console.log(`🛡️ [IP] Usando Proxy Externo: ${randomProxy.includes('@') ? randomProxy.split('@')[1] : randomProxy}`);
+        console.log(`🛡️ [IP] Usando Proxy Estático: ${randomProxy.includes('@') ? randomProxy.split('@')[1] : randomProxy}`);
     } else {
-        console.log('✨ [Info] Usando o "Stealth Mode" nativo do Browserless para evitar bloqueios.');
+        console.log('✨ [Info] Ativando Stealth Mode Nativo do Browserless.');
     }
     return ws;
 }
@@ -133,26 +138,34 @@ async function performScrape(filters) {
     const results = [];
     const foundLinks = [];
 
-    let browser;
+    let browser, context, page;
+
+    // Função interna para (re)iniciar o browser de forma robusta
+    const startBrowser = async () => {
+        try {
+            if (browser) await browser.close().catch(() => { });
+            console.log(`🌐 [Conexão] Abrindo nova sessão Browserless...`);
+            browser = await chromium.connectOverCDP(getBrowserlessWS());
+            context = await browser.newContext({
+                userAgent: getRandomUA(),
+                viewport: {
+                    width: 1280 + Math.floor(Math.random() * 100),
+                    height: 720 + Math.floor(Math.random() * 100)
+                },
+                locale: 'pt-BR'
+            });
+            page = await context.newPage();
+            // Bloqueia lixo para ser mais rápido e menos detectável
+            await page.route('**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}', route => route.abort());
+            return page;
+        } catch (e) {
+            console.error("❌ Erro ao iniciar browser:", e.message);
+            throw e;
+        }
+    };
+
     try {
-        const wsUrl = getBrowserlessWS();
-        console.log(`🌐 [Conexão] Iniciando nova sessão limpa...`);
-        browser = await chromium.connectOverCDP(wsUrl);
-
-        const context = await browser.newContext({
-            userAgent: getRandomUA(),
-            viewport: {
-                width: 1280 + Math.floor(Math.random() * 100),
-                height: 720 + Math.floor(Math.random() * 100)
-            },
-            locale: 'pt-BR',
-            timezoneId: 'America/Sao_Paulo',
-            geolocation: { longitude: -46.6333, latitude: -23.5505 },
-            permissions: ['geolocation']
-        });
-        const page = await context.newPage();
-        await page.route('**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}', route => route.abort());
-
+        await startBrowser();
         await updateStatus("Robô conectado. Iniciando...", 10);
 
         const regions = filters.regions || ['alphaville'];
@@ -203,14 +216,15 @@ async function performScrape(filters) {
                         });
 
                         if (isBlocked) {
-                            console.warn(`🛑 Bloqueio detectado no anúncio! Pulando e ajustando tempo...`);
-                            await updateStatus(`Bloqueado pelo OLX. Reajustando estratégia...`, currentProgress, adUrl, foundLinks);
+                            console.warn(`🛑 Bloqueio detectado! Reiniciando sessão para trocar IP...`);
+                            await updateStatus(`Bloqueado! Mudando IP e tentando novamente...`, currentProgress, adUrl, foundLinks);
 
-                            // Em vez de reiniciar tudo (que gasta créditos), vamos apenas esperar mais
-                            // e mudar o User Agent na próxima tentativa se possível via contexto, 
-                            // mas aqui vamos apenas dar skip para não travar a fila.
-                            const waitTime = 20000 + Math.floor(Math.random() * 30000);
+                            await startBrowser(); // Mata o antigo e abre novo (Browserless muda o IP)
+                            const waitTime = 15000 + Math.floor(Math.random() * 20000);
                             await new Promise(r => setTimeout(r, waitTime));
+
+                            // Tenta carregar o anúncio novamente com a nova 'page'
+                            await page.goto(adUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
                             continue;
                         }
 
@@ -288,6 +302,11 @@ async function performScrape(filters) {
                     }
                 } catch (e) {
                     console.error(`Erro na página ${url}:`, e.message);
+                    // Erro de "context closed" significa que Browserless derrubou a gente
+                    if (e.message.includes('closed') || e.message.includes('disconnected')) {
+                        console.log('🔌 Conexão perdida. Reestabelecendo e continuando de onde paramos...');
+                        await startBrowser().catch(err => console.error('Erro ao reconectar:', err.message));
+                    }
                 }
             }
         }
