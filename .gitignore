@@ -1,0 +1,6 @@
+node_modules/
+.env
+firebase-key.json
+.wwebjs_auth_hf/
+.wwebjs_cache/
+*.log
