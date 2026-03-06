@@ -24,7 +24,37 @@ if (!admin.apps.length) {
 
 const db = admin.firestore();
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '2U1KDYckXbPO4pc065f0e047f92f67e4ab2dbe8e65ac0fd55';
-const BROWSERLESS_WS = `wss://chrome.browserless.io?token=${BROWSERLESS_TOKEN}`;
+
+// Se tiver uma lista de proxies separada por vírgula no .env
+const PROXY_LIST = (process.env.SCRAPER_PROXY_LIST || process.env.SCRAPER_PROXY || '').split(',').filter(p => !!p);
+
+function getBrowserlessWS() {
+    // Usamos flags nativas do Browserless para aumentar o sucesso:
+    // --stealth: Ativa o modo furtivo nativo do Browserless
+    // --blockAds: Remove anúncios que podem causar lentidão e detecção
+    // proxyCountry=br: Tenta usar infraestrutura brasileira se disponível
+    let ws = `wss://chrome.browserless.io?token=${BROWSERLESS_TOKEN}&--stealth&--blockAds&proxyCountry=br`;
+
+    if (PROXY_LIST.length > 0) {
+        const randomProxy = PROXY_LIST[Math.floor(Math.random() * PROXY_LIST.length)];
+        ws += `&--proxy-server=${randomProxy}`;
+        console.log(`🛡️ [IP] Usando Proxy Externo: ${randomProxy.includes('@') ? randomProxy.split('@')[1] : randomProxy}`);
+    } else {
+        console.log('✨ [Info] Usando o "Stealth Mode" nativo do Browserless para evitar bloqueios.');
+    }
+    return ws;
+}
+
+const USER_AGENTS = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/122.0.0.0 Safari/537.36'
+];
+
+function getRandomUA() {
+    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
 
 async function updateStatus(message, progress = 0, currentItem = null, links = []) {
     console.log(`📡 [Status] ${message} (${progress}%)`);
@@ -39,6 +69,18 @@ async function updateStatus(message, progress = 0, currentItem = null, links = [
 // ==========================================
 async function monitorRequests() {
     console.log('👀 [Monitor] Iniciado. Verificando pedidos a cada 30 segundos...');
+
+    // Verificação de Banco na Partida
+    try {
+        const stats = await db.collection('listings').get();
+        console.log(`📊 [Banco] Total de registros atuais no Firestore: ${stats.size}`);
+        if (stats.size > 0) {
+            console.log('Últimos 3 títulos cadastrados:');
+            stats.docs.slice(-3).forEach(d => console.log(' - ' + (d.data().title || 'Sem Título')));
+        }
+    } catch (e) {
+        console.error("❌ ERRO ao ler registros do banco:", e.message);
+    }
 
     while (true) {
         try {
@@ -93,8 +135,21 @@ async function performScrape(filters) {
 
     let browser;
     try {
-        browser = await chromium.connectOverCDP(BROWSERLESS_WS);
-        const context = await browser.newContext({ userAgent: 'Mozilla/5.0...' });
+        const wsUrl = getBrowserlessWS();
+        console.log(`🌐 [Conexão] Iniciando nova sessão limpa...`);
+        browser = await chromium.connectOverCDP(wsUrl);
+
+        const context = await browser.newContext({
+            userAgent: getRandomUA(),
+            viewport: {
+                width: 1280 + Math.floor(Math.random() * 100),
+                height: 720 + Math.floor(Math.random() * 100)
+            },
+            locale: 'pt-BR',
+            timezoneId: 'America/Sao_Paulo',
+            geolocation: { longitude: -46.6333, latitude: -23.5505 },
+            permissions: ['geolocation']
+        });
         const page = await context.newPage();
         await page.route('**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}', route => route.abort());
 
@@ -140,6 +195,25 @@ async function performScrape(filters) {
 
                         await page.goto(adUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
+                        // Detecção de Bloqueio / Cloudflare
+                        const isBlocked = await page.evaluate(() => {
+                            const t = document.title?.toLowerCase() || '';
+                            const b = document.body?.innerText?.toLowerCase() || '';
+                            return t.includes('blocked') || t.includes('captcha') || t.includes('access denied') || b.includes('sorry, you have been blocked');
+                        });
+
+                        if (isBlocked) {
+                            console.warn(`🛑 Bloqueio detectado no anúncio! Pulando e ajustando tempo...`);
+                            await updateStatus(`Bloqueado pelo OLX. Reajustando estratégia...`, currentProgress, adUrl, foundLinks);
+
+                            // Em vez de reiniciar tudo (que gasta créditos), vamos apenas esperar mais
+                            // e mudar o User Agent na próxima tentativa se possível via contexto, 
+                            // mas aqui vamos apenas dar skip para não travar a fila.
+                            const waitTime = 20000 + Math.floor(Math.random() * 30000);
+                            await new Promise(r => setTimeout(r, waitTime));
+                            continue;
+                        }
+
                         const data = await page.evaluate(() => {
                             const getDetail = (text) => {
                                 const sel = [
@@ -178,6 +252,11 @@ async function performScrape(filters) {
                             };
                         });
 
+                        if (data.title?.toLowerCase().includes("blocked") || data.title === "Sem Título") {
+                            console.warn(`⚠️ Dados inválidos capturados (provável bloqueio): ${adUrl}`);
+                            continue;
+                        }
+
                         const item = {
                             ...data,
                             link: adUrl,
@@ -189,16 +268,23 @@ async function performScrape(filters) {
                         };
 
                         await db.collection('listings').doc(docId).set(item, { merge: true });
-                        console.log(`✅ Extraído e Salvo: ${data.title} - ${data.price}`);
+                        const verify = await db.collection('listings').doc(docId).get();
+                        if (verify.exists) {
+                            console.log(`✅ CONFIRMADO NO FIREBASE: ${data.title} - ${data.price} (ID: ${docId})`);
+                        } else {
+                            console.warn(`⁉️ ERRO: O registro de ${data.title} não foi encontrado após o salvamento.`);
+                        }
 
                         results.push(item);
                         foundLinks.push(adUrl);
 
-                        // Atualiza o status IMEDIATAMENTE após o save para aparecer na tela original
+                        // Atualiza o status IMEDIATAMENTE após o save
                         await updateStatus(`Item ${results.length} salvo!`, Math.floor((results.length / limit) * 100), adUrl, foundLinks);
 
-                        // Espera um pouco entre anúncios para evitar Cloudflare
-                        await new Promise(r => setTimeout(r, 15000));
+                        // Espera dinâmico e aleatório (Simula comportamento humano)
+                        const nextWait = 15000 + Math.floor(Math.random() * 15000);
+                        console.log(`😴 Aguardando ${Math.floor(nextWait / 1000)}s para o próximo...`);
+                        await new Promise(r => setTimeout(r, nextWait));
                     }
                 } catch (e) {
                     console.error(`Erro na página ${url}:`, e.message);
