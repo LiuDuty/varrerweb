@@ -2,22 +2,15 @@ require('dotenv').config();
 const admin = require('firebase-admin');
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
-const { DateTime } = require('luxon');
 
-// Add stealth plugin
 chromium.use(stealth);
 
 // ==========================================
-// CONFIGURAÇÃO FIREBASE (ADMIN SDK)
+// CONFIGURAÇÃO FIREBASE
 // ==========================================
 let serviceAccount;
 try {
-    if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    } else {
-        // Fallback para arquivo local se no ambiente de desenvolvimento
-        serviceAccount = require('./firebase-key.json');
-    }
+    serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT) : require('./firebase-key.json');
 } catch (e) {
     console.error("❌ ERRO: Credenciais do Firebase ausentes.");
     process.exit(1);
@@ -33,187 +26,187 @@ const db = admin.firestore();
 const BROWSERLESS_TOKEN = process.env.BROWSERLESS_TOKEN || '2U1KDYckXbPO4pc065f0e047f92f67e4ab2dbe8e65ac0fd55';
 const BROWSERLESS_WS = `wss://chrome.browserless.io?token=${BROWSERLESS_TOKEN}`;
 
-// ==========================================
-// FUNÇÕES DE STATUS NO FIRESTORE
-// ==========================================
 async function updateStatus(message, progress = 0, currentItem = null, links = []) {
-    console.log(`📡 [STATUS] ${message} (${progress}%)`);
-    try {
-        await db.collection('system').doc('status').set({
-            message,
-            progress,
-            currentItem,
-            links,
-            lastUpdate: admin.firestore.FieldValue.serverTimestamp()
-        }, { merge: true });
-    } catch (e) {
-        console.error("Erro ao atualizar status:", e.message);
-    }
+    console.log(`📡 [Status] ${message} (${progress}%)`);
+    await db.collection('system').doc('status').set({
+        message, progress, currentItem, links,
+        lastUpdate: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
 }
 
 // ==========================================
-// LÓGICA DE EXTRAÇÃO
+// MONITOR DE PEDIDOS (LOOP INFINITO)
 // ==========================================
-async function startScraping() {
-    console.log('🚀 [Boot] Iniciando Scraper Autônomo...');
+async function monitorRequests() {
+    console.log('👀 [Monitor] Iniciado. Verificando pedidos a cada 30 segundos...');
 
-    // 1. Verificar Parâmetros na Base de Dados
-    console.log('📡 Buscando parâmetros de extração (filtros)...');
-    const filterDoc = await db.collection('system').doc('filters').get();
+    while (true) {
+        try {
+            // Verifica pedidos pendentes sem orderBy para evitar erro de índice
+            const snapshot = await db.collection('requests')
+                .where('status', '==', 'pending')
+                .limit(10)
+                .get();
 
-    if (!filterDoc.exists) {
-        console.log('⚠️ [Fim] Nenhum parâmetro de extração (filtros) encontrado na base de dados.');
-        console.log('Finalizado sem fazer a extração.');
-        return;
-    }
+            if (!snapshot.empty) {
+                // Ordenar manualmente no JS
+                const docs = snapshot.docs.sort((a, b) => {
+                    const tA = a.data().requestedAt?.toDate() || 0;
+                    const tB = b.data().requestedAt?.toDate() || 0;
+                    return tA - tB;
+                });
 
-    const filters = filterDoc.data();
-    if (!filters.regions || filters.regions.length === 0) {
-        console.log('⚠️ [Fim] Filtros sem regiões selecionadas.');
-        return;
-    }
+                const requestDoc = docs[0];
+                const requestData = requestDoc.data();
 
-    console.log(`🎯 Parâmetros carregados: ${JSON.stringify(filters)}`);
+                console.log(`🚀 [Execução] Processando pedido: ${requestDoc.id}`);
 
-    // Inicia status
-    await updateStatus("Iniciando extração autônoma...", 5);
+                // Marcar como processando para ninguém mais pegar
+                await requestDoc.ref.update({ status: 'processing', startedAt: admin.firestore.FieldValue.serverTimestamp() });
 
-    try {
-        const results = await performScrape(filters);
-        console.log(`✅ Processo finalizado. Total processado: ${results.length}`);
-        await updateStatus("Finalizado com sucesso!", 100);
-    } catch (err) {
-        console.error("💥 Erro crítico no processo:", err);
-        await updateStatus(`Erro crítico: ${err.message}`, 0);
-    } finally {
-        // Encerrar processo para garantir que não fique rodando infinitamente se não houver agendamento interno
-        process.exit(0);
+                // Rodar Extração
+                await performScrape(requestData.filters || {});
+
+                // Finalizar e Deletar Pedido
+                await requestDoc.ref.delete();
+                console.log(`✅ [Fim] Pedido ${requestDoc.id} concluído e removido.`);
+
+                // Aguarda um pouco antes de checar o próximo se acabou de rodar
+                await new Promise(r => setTimeout(r, 5000));
+                continue;
+            } else {
+                // console.log('😴 Nando pedido pendente...');
+            }
+        } catch (e) {
+            console.error("💥 Erro no monitor:", e.message);
+        }
+
+        // Aguarda 30 segundos
+        await new Promise(r => setTimeout(r, 30000));
     }
 }
 
 async function performScrape(filters) {
-    const limit = filters.limit || 50;
+    const limit = filters.limit_enabled ? parseInt(filters.limit_value || 3) : 50;
+    const results = [];
     const foundLinks = [];
-    const newResults = [];
 
-    console.log(`📡 OLX: Conectando via Browserless...`);
-    const browser = await chromium.connectOverCDP(BROWSERLESS_WS);
-    const context = await browser.newContext({
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-    });
-    const page = await context.newPage();
-    await page.route('**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}', route => route.abort());
+    let browser;
+    try {
+        browser = await chromium.connectOverCDP(BROWSERLESS_WS);
+        const context = await browser.newContext({ userAgent: 'Mozilla/5.0...' });
+        const page = await context.newPage();
+        await page.route('**/*.{png,jpg,jpeg,gif,svg,css,woff,woff2}', route => route.abort());
 
-    // Gerar URLs baseado nos filtros
-    const initialUrls = [];
-    filters.regions.forEach(r => {
-        filters.types.forEach(t => {
-            initialUrls.push({
-                url: generateOlxUrl(r, t, filters.priceMin, filters.priceMax),
-                region: r,
-                type: t
-            });
-        });
-    });
+        await updateStatus("Robô conectado. Iniciando...", 10);
 
-    for (const urlObj of initialUrls) {
-        if (newResults.length >= limit) break;
+        const regions = filters.regions || ['alphaville'];
+        const types = filters.types || ['venda'];
 
-        console.log(`📡 OLX: Navegando para lista (${urlObj.region}/${urlObj.type}): ${urlObj.url}`);
-        await page.goto(urlObj.url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        for (const r of regions) {
+            for (const t of types) {
+                if (results.length >= limit) break;
 
-        const title = await page.title();
-        if (title.includes("Access Denied") || title.includes("Cloudflare")) {
-            console.error("🚫 Bloqueado pelo Cloudflare.");
-            continue;
-        }
+                const url = generateOlxUrl(r, t, filters.priceMin, filters.priceMax);
+                console.log(`📡 Navegando: ${url}`);
 
-        const adUrlsResults = await page.evaluate(() => {
-            const cardLinks = Array.from(document.querySelectorAll('a.olx-adcard__link'));
-            if (cardLinks.length > 0) return cardLinks.map(a => a.href.split('?')[0]);
-            return Array.from(document.querySelectorAll('a'))
-                .map(a => a.href)
-                .filter(h => h && h.includes('olx.com.br/') && h.includes('/imoveis/') && /\d{8,}/.test(h))
-                .map(h => h.split('?')[0]);
-        });
+                try {
+                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
 
-        const targetUrls = Array.from(new Set(adUrlsResults)).slice(0, limit - newResults.length);
+                    const adLinks = await page.evaluate(() => {
+                        const links = Array.from(document.querySelectorAll('a.olx-adcard__link')).map(a => a.href.split('?')[0]);
+                        if (links.length > 0) return links;
 
-        for (const adUrl of targetUrls) {
-            try {
-                // Check if already exists to skip re-scraping the same item details
-                const docId = Buffer.from(adUrl).toString('base64').replace(/[/+=]/g, '');
-                const existing = await db.collection('listings').doc(docId).get();
-                if (existing.exists && existing.data().status === 'ignored') continue;
+                        // Fallback para outros tipos de cards da OLX
+                        return Array.from(document.querySelectorAll('a'))
+                            .map(a => a.href)
+                            .filter(h => h && h.includes('olx.com.br/') && h.includes('/imoveis/') && /\d{8,}/.test(h))
+                            .map(h => h.split('?')[0]);
+                    });
 
-                await updateStatus(`Extraindo ${newResults.length + 1}/${limit}`, 50, adUrl, foundLinks);
-                await page.goto(adUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
-                await page.waitForTimeout(1000);
+                    for (const adUrl of adLinks.slice(0, limit - results.length)) {
+                        const docId = Buffer.from(adUrl).toString('base64').replace(/[/+=]/g, '');
+                        const existing = await db.collection('listings').doc(docId).get();
+                        if (existing.exists && existing.data().status === 'ignored') continue;
 
-                const data = await page.evaluate(() => {
-                    const ogDesc = document.querySelector('meta[property="og:description"]')?.content || '';
-                    const phoneRegex = /\(?\d{2}\)?\s*(?:9\s?\d{4}|[2-9]\d{3})[-\s]?\d{4}/g;
-                    const phones = (ogDesc.match(phoneRegex) || []).filter(s => s.replace(/\D/g, '').length >= 10);
-                    const bestPhone = phones.length > 0 ? phones[0] : "Não informado";
+                        await updateStatus(`Extraindo ${results.length + 1}/${limit}`, 50, adUrl, foundLinks);
+                        await page.goto(adUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
 
-                    const getDetail = (text) => {
-                        const sel = ['div[data-testid="ad-properties"] div', 'div.ad__sc-2h9gkk-0 div', '#details div'];
-                        for (const s of sel) {
-                            const found = Array.from(document.querySelectorAll(s)).find(el => el.innerText.includes(text));
-                            if (found) {
-                                const val = found.querySelector('a') || found.querySelector('span:last-child') || found;
-                                return val.innerText.replace(text, "").replace(":", "").trim();
-                            }
-                        }
-                        return null;
-                    };
+                        const data = await page.evaluate(() => {
+                            const getDetail = (text) => {
+                                const sel = [
+                                    'div[data-testid="ad-properties"] div', // Olx TestId
+                                    'div.ad__sc-2h9gkk-0 div',              // Nova Classe
+                                    'ul.ad__sc-1f7p06-0 li',               // Lista de detalhes
+                                    '#details div',                         // Fallback legado
+                                    'div.sc-1f7p06-1'                       // Outra classe comum
+                                ];
+                                for (const s of sel) {
+                                    const elements = Array.from(document.querySelectorAll(s));
+                                    const found = elements.find(el => el.innerText.includes(text));
+                                    if (found) {
+                                        const valEl = found.querySelector('a') || found.querySelector('span:last-child') || found.querySelector('dt + dd') || found;
+                                        if (valEl) {
+                                            const rawValue = valEl.innerText.replace(text, "").replace(":", "").trim();
+                                            if (rawValue && rawValue.length < 50) return rawValue;
+                                        }
+                                    }
+                                }
+                                return null;
+                            };
 
-                    return {
-                        title: document.querySelector('h1')?.innerText.trim() || "Sem Título",
-                        price: document.querySelector('span.typo-display-large')?.innerText.trim() || "N/A",
-                        phone: bestPhone,
-                        contactName: ogDesc.match(/\(([^)]{2,30})\)\s*$/)?.[1]?.trim() || "Desconhecido",
-                        rooms: getDetail("Quartos"),
-                        area: getDetail("Área útil") || getDetail("Área construída") || getDetail("Área total"),
-                        location: document.querySelector('.ad__sc-1m38784-0')?.innerText.replace("Exibir no mapa", "").trim() || "N/D"
-                    };
-                });
+                            const ogDesc = document.querySelector('meta[property="og:description"]')?.content || '';
 
-                // Gravando no Firebase
-                const item = {
-                    ...data,
-                    link: adUrl,
-                    region: urlObj.region,
-                    listingType: urlObj.type,
-                    status: existing.exists ? existing.data().status : "active",
-                    capturedAt: existing.exists ? existing.data().capturedAt : admin.firestore.FieldValue.serverTimestamp(),
-                    lastUpdated: admin.firestore.FieldValue.serverTimestamp()
-                };
+                            return {
+                                title: document.querySelector('h1')?.innerText?.trim() || "Sem Título",
+                                price: document.querySelector('span.typo-display-large')?.innerText?.trim() || "N/A",
+                                rooms: getDetail("Quartos"),
+                                area: getDetail("Área útil") || getDetail("Área construída") || getDetail("Área total"),
+                                garage: getDetail("Vagas na garagem") || getDetail("Vagas"),
+                                condo: getDetail("Condomínio") || getDetail("Taxa de condomínio"),
+                                location: document.querySelector('.ad__sc-1m38784-0')?.innerText?.replace("Exibir no mapa", "")?.trim() ||
+                                    document.querySelector('span.sc-1f3m9u2-0')?.innerText?.trim() || "N/D",
+                                contactName: ogDesc.match(/\(([^)]{2,30})\)\s*$/)?.[1]?.trim() || "Desconhecido"
+                            };
+                        });
 
-                await db.collection('listings').doc(docId).set(item, { merge: true });
-                newResults.push(item);
-                foundLinks.push(adUrl);
-                console.log(`✅ Salvo: ${data.price} | ${adUrl}`);
-            } catch (e) {
-                console.error(`⚠️ Erro ao processar ${adUrl}: ${e.message}`);
+                        const item = {
+                            ...data,
+                            link: adUrl,
+                            region: r,
+                            listingType: t,
+                            status: existing.exists ? existing.data().status : 'active',
+                            capturedAt: existing.exists ? existing.data().capturedAt : admin.firestore.FieldValue.serverTimestamp(),
+                            lastUpdated: admin.firestore.FieldValue.serverTimestamp()
+                        };
+
+                        await db.collection('listings').doc(docId).set(item, { merge: true });
+                        results.push(item);
+                        foundLinks.push(adUrl);
+
+                        // Espera um pouco entre anúncios para evitar Cloudflare
+                        await new Promise(r => setTimeout(r, 10000));
+                    }
+                } catch (e) {
+                    console.error(`Erro na página ${url}:`, e.message);
+                }
             }
         }
+        await updateStatus("Extração concluída!", 100, null, foundLinks);
+    } catch (err) {
+        console.error("Erro Fatal:", err.message);
+        await updateStatus(`Erro: ${err.message}`, 0);
+    } finally {
+        if (browser) await browser.close();
     }
-    await browser.close();
-    return newResults;
 }
 
-function generateOlxUrl(region, type, priceMin, priceMax) {
-    const regionMap = { 'alphaville': 'alphaville', 'tambore': 'tambore', 'barueri': 'barueri' };
-    const regionPath = regionMap[region] || region;
-    const baseUrl = `https://www.olx.com.br/imoveis/${type}/estado-sp/sao-paulo-e-regiao/${regionPath}`;
-    const url = new URL(baseUrl);
-    if (priceMin) url.searchParams.set('ps', priceMin);
-    if (priceMax) url.searchParams.set('pe', priceMax);
-    url.searchParams.set('f', 'p');
-    url.searchParams.set('sf', '1');
-    url.searchParams.set('sp', '6');
+function generateOlxUrl(region, type, min, max) {
+    const url = new URL(`https://www.olx.com.br/imoveis/${type}/estado-sp/sao-paulo-e-regiao/${region}`);
+    if (min) url.searchParams.set('ps', min);
+    if (max) url.searchParams.set('pe', max);
+    url.searchParams.set('f', 'p'); url.searchParams.set('sf', '1');
     return url.toString();
 }
 
-startScraping();
+monitorRequests();
